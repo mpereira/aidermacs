@@ -747,9 +747,18 @@ With prefix argument `C-u', add as READ-ONLY.
 If current buffer is visiting a file, its name is used as initial input.
 Multiple files can be selected by calling the command multiple times."
   (interactive "P")
-  (let ((file (expand-file-name
-               (read-file-name "Select file to add: "
-                               nil nil t))))
+  (let ((file (cond
+               ((eq aidermacs-file-find-function 'project-find-file)
+                (let ((project-root (aidermacs-project-root)))
+                  (expand-file-name
+                   (or (progn
+                         (let ((default-directory project-root))
+                           (project-find-file))
+                         (buffer-file-name (current-buffer)))
+                       (user-error "No file selected")))))
+               (t (expand-file-name
+                   (read-file-name "Select file to add: "
+                                   nil nil t))))))
     (cond
      ((file-directory-p file)
       (when (yes-or-no-p (format "Add all files in directory %s? " file))
@@ -883,9 +892,19 @@ snippets, or other content to the session."
 This allows you to add the file's content to a specific session."
   (interactive
    (let* ((initial (when buffer-file-name
-                     (file-name-nondirectory buffer-file-name))))
-     (list (read-file-name "Select file to add to existing session: "
-                           nil nil t initial))))
+                     (file-name-nondirectory buffer-file-name)))
+          (file (cond
+                 ((eq aidermacs-file-find-function 'project-find-file)
+                  (let ((project-root (aidermacs-project-root)))
+                    (expand-file-name
+                     (or (progn
+                           (let ((default-directory project-root))
+                             (project-find-file))
+                           (buffer-file-name (current-buffer)))
+                         (user-error "No file selected")))))
+                 (t (read-file-name "Select file to add to existing session: "
+                                    nil nil t initial)))))
+     (list file)))
   (cond
    ((not (file-exists-p file))
     (error "File does not exist: %s" file))
@@ -1011,6 +1030,14 @@ Provides these keybindings:
 \\{aidermacs-minor-mode-map}"
   :lighter " aidermacs"
   :keymap aidermacs-minor-mode-map)
+
+(defcustom aidermacs-file-find-function 'read-file-name
+  "Function to use for finding files in aidermacs.
+Options are:
+- `read-file-name': Standard Emacs file selection dialog
+- `project-find-file': Project-aware file selection (requires `project.el')"
+  :type '(choice (const :tag "Standard file dialog" read-file-name)
+                 (const :tag "Project-aware file selection" project-find-file)))
 
 ;; Auto-enable aidermacs-minor-mode for specific files
 (defcustom aidermacs-auto-mode-files
