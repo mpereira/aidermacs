@@ -97,6 +97,14 @@ When nil, require explicit confirmation before applying changes."
 (defvar aidermacs--read-string-history nil
   "History list for aidermacs read string inputs.")
 
+(defcustom aidermacs-form-prompt-input-type 'completing-read
+  "Method to use for getting user input in `aidermacs--form-prompt'.
+Options are:
+- `completing-read': Use minibuffer with completion
+- `buffer': Open a dedicated markdown buffer for editing"
+  :type '(choice (const :tag "Minibuffer with completion" completing-read)
+                 (const :tag "Dedicated markdown buffer" buffer)))
+
 (defcustom aidermacs-common-prompts
   '("What does this code do? Explain the logic step by step"
     "Explain the overall architecture of this codebase"
@@ -575,30 +583,118 @@ Sends the \"/ls\" command and displays the results in a Dired buffer."
       (message "Closing aidermacs file buffer after dropping files")
       (kill-buffer (aidermacs-get-buffer-name nil " Files")))))
 
+(defun aidermacs--get-prompt-from-buffer (prompt-buffer-name initial-content)
+  "Get user input from a dedicated buffer named PROMPT-BUFFER-NAME.
+INITIAL-CONTENT is the text to pre-populate the buffer with.
+Returns the buffer content when the user submits with C-c C-c."
+  (let ((prompt-buffer (get-buffer-create prompt-buffer-name)))
+    (with-current-buffer prompt-buffer
+      (erase-buffer)
+      (when (fboundp 'markdown-mode)
+        (markdown-mode)
+        (message "Using markdown-mode for prompt buffer"))
+      (insert initial-content)
+      (goto-char (point-max))
+      ;; Store the original window configuration to restore later
+      (setq-local aidermacs--original-window-config (current-window-configuration))
+      ;; Set up a local keymap with the C-c C-c binding
+      (let ((map (make-sparse-keymap)))
+        (set-keymap-parent map (current-local-map))
+        (define-key map (kbd "C-c C-c")
+          (lambda ()
+            (interactive)
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              ;; Restore the original window configuration
+              (when (boundp 'aidermacs--original-window-config)
+                (set-window-configuration aidermacs--original-window-config))
+              ;; Kill the prompt buffer
+              (kill-buffer prompt-buffer)
+              ;; Continue with the command using the buffer content
+              (aidermacs--continue-with-prompt content))))
+        (use-local-map map))
+      (message "Type your prompt and press C-c C-c when done"))
+    ;; Display the prompt buffer
+    (pop-to-buffer prompt-buffer)
+    ;; Return nil to indicate we're waiting for callback
+    nil))
+
+(defvar aidermacs--prompt-continuation nil
+  "Stores information needed to continue after getting prompt from buffer.")
+
 (defun aidermacs--form-prompt (command &optional prompt-prefix guide ignore-context)
   "Get command based on context with COMMAND and PROMPT-PREFIX.
 COMMAND is the text to prepend.  PROMPT-PREFIX is the text to add after COMMAND.
 GUIDE is displayed in the prompt but not included in the final command.
-Use highlighted region as context unless IGNORE-CONTEXT is set to non-nil."
+Use highlighted region as context unless IGNORE-CONTEXT is set to non-nil.
+Uses `aidermacs-form-prompt-input-type' to determine input method."
   (let* ((region-text (when (and (use-region-p) (not ignore-context))
                         (buffer-substring-no-properties (region-beginning) (region-end))))
          (context (when region-text
                     (format " in %s regarding this section:\n```\n%s\n```\n" (buffer-name) region-text)))
+         (prompt-text (concat command " " prompt-prefix context
+                              (when guide (format " (%s)" guide)) ": "))
          ;; Create completion table from common prompts and history
          (completion-candidates
           (delete-dups (append aidermacs-common-prompts
-                               aidermacs--read-string-history)))
-         ;; Read user input with completion
-         (user-command (completing-read
-                        (concat command " " prompt-prefix context
-                                (when guide (format " (%s)" guide)) ": ")
-                        completion-candidates nil nil nil
-                        'aidermacs--read-string-history)))
-    ;; Add to history if not already there, removing any duplicates
-    (setq aidermacs--read-string-history
-          (delete-dups (cons user-command aidermacs--read-string-history)))
-    (concat command (and (not (string-empty-p user-command))
-                         (concat " " prompt-prefix context ": " user-command)))))
+                               aidermacs--read-string-history))))
+
+    (pcase aidermacs-form-prompt-input-type
+      ('completing-read
+       (let ((user-command (completing-read prompt-text completion-candidates nil nil nil
+                                            'aidermacs--read-string-history)))
+         (setq aidermacs--read-string-history
+               (delete-dups (cons user-command aidermacs--read-string-history)))
+         (concat command (and (not (string-empty-p user-command))
+                              (concat " " prompt-prefix context ": " user-command)))))
+
+      ('buffer
+       (setq aidermacs--prompt-continuation
+             (list :command command
+                   :prompt-prefix prompt-prefix
+                   :context context))
+       (let* ((buffer-name "*Aidermacs Prompt*")
+              (separator (make-string 80 ?-))
+              (initial-content
+               (concat "<!-- Previous prompts (for reference):\n"
+                       (mapconcat (lambda (entry)
+                                    (concat entry "\n\n" separator))
+                                  (seq-take aidermacs--read-string-history 5)
+                                  "\n\n")
+                       "\n-->\n\n")))
+         (aidermacs--get-prompt-from-buffer buffer-name initial-content)
+         ;; Return nil to indicate we're waiting for callback
+         ;; `aidermacs--continue-with-prompt'
+         ;; `aidermacs--get-prompt-from-buffer'
+         nil))
+
+      (_ (error "Invalid aidermacs-form-prompt-input-type: %s"
+                aidermacs-form-prompt-input-type)))))
+
+(defun aidermacs--continue-with-prompt (user-command)
+  "Continue processing after getting prompt from buffer.
+USER-COMMAND is the text entered by the user in the prompt buffer."
+  (when aidermacs--prompt-continuation
+    (let* ((command (plist-get aidermacs--prompt-continuation :command))
+           (prompt-prefix (plist-get aidermacs--prompt-continuation :prompt-prefix))
+           (context (plist-get aidermacs--prompt-continuation :context))
+           (user-command (string-trim user-command))
+           (final-command nil))
+
+      ;; Add to history if not already there
+      (setq aidermacs--read-string-history
+            (delete-dups (cons user-command aidermacs--read-string-history)))
+
+      ;; Format the final command
+      (setq final-command
+            (concat command (and (not (string-empty-p user-command))
+                                 (concat " " prompt-prefix context ": " user-command))))
+
+      ;; Reset the continuation variable
+      (setq aidermacs--prompt-continuation nil)
+
+      ;; Execute the command that was waiting for the prompt
+      (when final-command
+        (aidermacs--send-command final-command)))))
 
 (defun aidermacs-direct-change ()
   "Prompt the user for an input and send it to aidemracs prefixed with \"/code \"."
